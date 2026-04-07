@@ -2,9 +2,10 @@ import socket
 import time
 import threading
 import json
-import os  # Para verificar espaço em disco
+import os
 
-HOST = '10.62.206.208'
+# Configurações do servidor
+HOST = socket.gethostbyname(socket.gethostname())
 PORT = 8000
 
 # Variáveis globais
@@ -12,11 +13,30 @@ is_master = False
 heartbeat_interval = 5  # Intervalo entre heartbeats (em segundos)
 heartbeat_failures = 0
 max_failures = 4  # Número máximo de falhas antes de iniciar a eleição
-workers = []  # Lista de workers conectados
+workers = [
+    "10.62.206.207:8000",
+    "10.62.206.208:8000"
+]  # Lista de workers conectados
 master_addr = None  # Endereço do master atual
 
 
+def get_local_ip():
+    """Obtém o IP local da máquina."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ip
+
+
+HOST = get_local_ip()
+PORT = 8000
+
+
 def tratar_cliente(conn, addr):
+    """Função para tratar mensagens recebidas de clientes (workers)."""
     global is_master, master_addr
     try:
         print(f"[THREAD] Iniciando atendimento para {addr}")
@@ -47,6 +67,7 @@ def tratar_cliente(conn, addr):
 
 
 def iniciar_servidor():
+    """Inicia o servidor para aceitar conexões."""
     global is_master, master_addr
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((HOST, PORT))
@@ -60,6 +81,7 @@ def iniciar_servidor():
 
 
 def iniciar_heartbeat():
+    """Função para monitorar o master via heartbeat."""
     global heartbeat_failures, is_master, master_addr
     while True:
         if not is_master and master_addr:
@@ -80,6 +102,7 @@ def iniciar_heartbeat():
 
 
 def iniciar_eleicao():
+    """Inicia o processo de eleição para escolher um novo master."""
     global is_master, master_addr, workers
     print("[ELEIÇÃO] Iniciando processo de eleição...")
     free_space = get_free_disk_space()
@@ -87,7 +110,7 @@ def iniciar_eleicao():
 
     for worker in workers:
         try:
-            with socket.create_connection(worker, timeout=2) as s:
+            with socket.create_connection((worker.split(":")[0], int(worker.split(":")[1])), timeout=2) as s:
                 payload = {"type": "election"}
                 s.sendall(json.dumps(payload).encode('utf-8'))
                 response = json.loads(s.recv(1024).decode('utf-8'))
@@ -96,22 +119,22 @@ def iniciar_eleicao():
             print(f"[ELEIÇÃO] Falha ao se comunicar com {worker}: {e}")
 
     # Determinar o novo master
-    responses.append((HOST, free_space))  # Incluir o próprio worker na eleição
+    responses.append((f"{HOST}:{PORT}", free_space))  # Incluir o próprio worker na eleição
     new_master = max(responses, key=lambda x: x[1])[0]
 
-    if new_master == HOST:
+    if new_master == f"{HOST}:{PORT}":
         is_master = True
         master_addr = (HOST, PORT)
         print("[ELEIÇÃO] Fui eleito como o novo master!")
     else:
-        master_addr = new_master
+        master_addr = (new_master.split(":")[0], int(new_master.split(":")[1]))
         print(f"[ELEIÇÃO] Novo master eleito: {master_addr}")
 
     # Notificar os workers sobre o novo master
     for worker in workers:
         try:
-            with socket.create_connection(worker, timeout=2) as s:
-                payload = {"type": "new_master", "master_addr": master_addr}
+            with socket.create_connection((worker.split(":")[0], int(worker.split(":")[1])), timeout=2) as s:
+                payload = {"type": "new_master", "master_addr": f"{master_addr[0]}:{master_addr[1]}"}
                 s.sendall(json.dumps(payload).encode('utf-8'))
         except Exception as e:
             print(f"[ELEIÇÃO] Falha ao notificar {worker}: {e}")
