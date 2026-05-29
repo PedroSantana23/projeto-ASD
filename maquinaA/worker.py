@@ -15,7 +15,7 @@ import uuid
 
 WORKER_UUID  = f"Worker-{uuid.uuid4().hex[:6]}"
 MASTER_HOST = "192.168.1.97"
-MASTER_PORT = 8001
+MASTER_PORT = 8000
 
 HEARTBEAT_INTERVAL = 30   # segundos entre heartbeats (spec: loop regular)
 TASK_INTERVAL      = 3    # segundos entre ciclos de pedido de tarefa

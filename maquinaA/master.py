@@ -23,17 +23,14 @@ def get_local_ip():
         s.close()
 
 HOST      = "192.168.1.97"
-PORT      = 8001
-MASTER_ID = "Master-B"
-NEIGHBOR_MASTERS = [("Master-A", "192.168.1.97", 8000)]
+PORT      = 8000
+MASTER_ID = "Master-A"
+NEIGHBOR_MASTERS = [("Master-B", "192.168.1.97", 8001)]   # ← mude para "Master-B" na segunda máquina
 
 # Thresholds (histerese obrigatória da spec)
 CAPACITY          = 10   # acima disso: saturado → pede ajuda
 RELEASE_THRESHOLD = 5    # abaixo disso: devolve workers emprestados
 
-# Vizinhos conhecidos: lista de (master_id, ip, porta)
-# Ex: [("Master-B", "192.168.1.50", 8000)]
-NEIGHBOR_MASTERS = []
 
 NEGOTIATION_TIMEOUT = 5   # spec: aguarda 5s antes de considerar indisponível
 
