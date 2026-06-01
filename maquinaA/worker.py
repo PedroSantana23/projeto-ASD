@@ -1,6 +1,6 @@
 """
-worker.py — Sistema P2P com Balanceamento de Carga Dinâmico
-Sprint 1 + Sprint 2 + Sprint 3 completos
+worker.py — Sprint 2.1 + Sprint 1 + Sprint 2 + Sprint 3
+Descoberta Dinâmica via UDP + Balanceamento de Carga P2P
 """
 
 import socket
@@ -10,43 +10,30 @@ import time
 import uuid
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIGURAÇÕES — ajuste antes de rodar
+# CONFIGURAÇÕES
 # ═══════════════════════════════════════════════════════════════════
 
-WORKER_UUID  = f"Worker-{uuid.uuid4().hex[:6]}"
-MASTER_HOST = "192.168.1.97"
-MASTER_PORT = 8000
+WORKER_UUID = f"Worker-{uuid.uuid4().hex[:6]}"
 
-HEARTBEAT_INTERVAL = 30   # segundos entre heartbeats (spec: loop regular)
-TASK_INTERVAL      = 3    # segundos entre ciclos de pedido de tarefa
-TIMEOUT            = 5    # spec: aguarda 5s antes de considerar conexão perdida
-MAX_RETRY_BACKOFF  = 30   # máximo de segundos de espera entre reconexões
+# ── Sprint 2.1: Worker NÃO tem IP/porta configurados ──────────────
+# Descobre o Master automaticamente via UDP Broadcast
+UDP_DISCOVERY_PORT    = 5000          # mesma porta que o Master escuta
+UDP_BROADCAST_ADDR    = "255.255.255.255"
+DISCOVERY_TIMEOUT     = 3             # janela de coleta de respostas (spec: 3s)
 
-# Se este worker for "emprestado" de outro master, preencha abaixo.
-# Deixe None para worker local normal.
-ORIGINAL_MASTER_UUID = None  # ex: "Master-B"
+# ── Resiliência ────────────────────────────────────────────────────
+HEARTBEAT_INTERVAL    = 30
+TASK_INTERVAL         = 3
+TCP_TIMEOUT           = 5            # spec: 5s timeout TCP
+MAX_RETRY_BACKOFF     = 30
 
-# ═══════════════════════════════════════════════════════════════════
-# ESTADO GLOBAL (mutável pelo ciclo de vida)
-# ═══════════════════════════════════════════════════════════════════
-
-state_lock = threading.Lock()
-
-# Endereço do Master ATUAL (muda após command_redirect)
-current_master_host = MASTER_HOST
-current_master_port = MASTER_PORT
-
-# Endereço do Master ORIGINAL (preenchido após command_redirect)
-original_master_address = None
-
-# Se emprestado, SERVER_UUID a enviar no payload ALIVE
-current_original_uuid = ORIGINAL_MASTER_UUID
-
-# Flag: tarefa em execução (impede redirect abrupto)
-task_in_progress = False
-
-# Flag: foi redirecionado e está aguardando processamento
-redirected = False
+# ── Estado mutável (endereço do master atual) ──────────────────────
+state_lock            = threading.Lock()
+current_master_host   = None
+current_master_port   = None
+original_master_addr  = None         # preenchido após command_redirect
+current_original_uuid = None         # SERVER_UUID enviado no ALIVE se emprestado
+task_in_progress      = False
 
 # ═══════════════════════════════════════════════════════════════════
 # UTILITÁRIOS
@@ -56,7 +43,6 @@ def send_json(conn, data: dict):
     conn.sendall((json.dumps(data) + "\n").encode("utf-8"))
 
 def recv_json(conn, timeout=None) -> dict | None:
-    """Acumula buffer TCP até encontrar \\n. Retorna None em timeout/erro."""
     buf = b""
     original_timeout = conn.gettimeout()
     if timeout is not None:
@@ -77,13 +63,14 @@ def recv_json(conn, timeout=None) -> dict | None:
     finally:
         conn.settimeout(original_timeout)
 
-def criar_conexao(host=None, port=None) -> socket.socket | None:
-    """Tenta conectar ao master atual. Retorna socket ou None."""
+def criar_conexao_tcp(host=None, port=None) -> socket.socket | None:
     h = host if host else current_master_host
     p = port if port else current_master_port
+    if not h or not p:
+        return None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(TIMEOUT)
+        s.settimeout(TCP_TIMEOUT)
         s.connect((h, p))
         s.settimeout(None)
         return s
@@ -96,29 +83,179 @@ def log(tag: str, msg: str):
     print(f"[{ts}][{WORKER_UUID}][{tag}] {msg}", flush=True)
 
 # ═══════════════════════════════════════════════════════════════════
-# SPRINT 1 — HEARTBEAT
+# SPRINT 2.1 — DESCOBERTA UDP
 # ═══════════════════════════════════════════════════════════════════
 
-def enviar_heartbeat():
+def descobrir_masters() -> list:
     """
-    Verifica se o Master atual está ativo.
-    Loga ALIVE ou OFFLINE. Em caso de falha reconecta com backoff.
+    Envia pacote DISCOVERY via UDP Broadcast.
+    Aguarda DISCOVERY_TIMEOUT segundos coletando respostas.
+    Retorna lista de Masters respondentes:
+      [{"MASTER_NAME": ..., "MASTER_IP": ..., "MASTER_PORT": ...}, ...]
     """
-    conn = criar_conexao()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(DISCOVERY_TIMEOUT)
+
+    payload = json.dumps({"TYPE": "DISCOVERY", "WORKER_UUID": WORKER_UUID}) + "\n"
+    log("DISCOVERY", f"Enviando DISCOVERY via broadcast {UDP_BROADCAST_ADDR}:{UDP_DISCOVERY_PORT}")
+
+    try:
+        sock.sendto(payload.encode("utf-8"), (UDP_BROADCAST_ADDR, UDP_DISCOVERY_PORT))
+    except Exception as e:
+        log("DISCOVERY", f"Erro ao enviar broadcast: {e}")
+        sock.close()
+        return []
+
+    masters_encontrados = []
+    deadline = time.time() + DISCOVERY_TIMEOUT
+
+    # Coleta todas as respostas dentro da janela de tempo (spec: janela fixa)
+    while time.time() < deadline:
+        try:
+            data, addr = sock.recvfrom(1024)
+            raw = data.decode("utf-8").strip()
+            resp = json.loads(raw)
+
+            # Strict parsing: descarta respostas sem MASTER_PORT (spec CT05)
+            if "MASTER_PORT" not in resp or "MASTER_NAME" not in resp or "MASTER_IP" not in resp:
+                log("DISCOVERY", f"Resposta malformada de {addr} — descartada.")
+                continue
+
+            if resp.get("TYPE") == "DISCOVERY_REPLY":
+                masters_encontrados.append(resp)
+                log("DISCOVERY", f"Master encontrado: {resp['MASTER_NAME']} em {resp['MASTER_IP']}:{resp['MASTER_PORT']}")
+
+        except socket.timeout:
+            break
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log("DISCOVERY", "Resposta com JSON inválido — descartada.")
+            continue
+
+    sock.close()
+    return masters_encontrados
+
+def eleger_master(masters: list) -> dict | None:
+    """
+    Eleição determinística: menor nome lexicográfico (MASTER_NAME).
+    Regra idêntica em todos os Workers — sem comunicação entre si.
+    Spec: MASTER_1 < MASTER_2 < MASTER_10
+    """
+    if not masters:
+        return None
+    eleito = sorted(masters, key=lambda m: m["MASTER_NAME"])[0]
+    log("ELECTION", f"Master eleito: {eleito['MASTER_NAME']} (menor nome lexicográfico)")
+    return eleito
+
+def confirmar_eleicao_tcp(master: dict) -> bool:
+    """
+    Após eleição, abre conexão TCP com o Master eleito.
+    Envia ELECTION_ACK e aguarda confirmação ACCEPTED.
+    Se falhar: invalida cache e reinicia descoberta.
+    """
+    global current_master_host, current_master_port
+
+    host = master["MASTER_IP"]
+    port = int(master["MASTER_PORT"])
+    name = master["MASTER_NAME"]
+
+    log("CONNECTING", f"Conectando via TCP ao Master eleito: {name} ({host}:{port})")
+
+    conn = criar_conexao_tcp(host, port)
     if conn is None:
-        log("HEARTBEAT", "Status: OFFLINE - Tentando Reconectar")
+        log("FALLBACK", f"Falha TCP ao conectar em {name}. Invalidando cache e reiniciando descoberta.")
         return False
 
     try:
-        send_json(conn, {"SERVER_UUID": WORKER_UUID, "TASK": "HEARTBEAT"})
-        response = recv_json(conn, timeout=TIMEOUT)
+        # Envia confirmação de eleição
+        send_json(conn, {
+            "TYPE":            "ELECTION_ACK",
+            "WORKER_UUID":     WORKER_UUID,
+            "SELECTED_MASTER": name
+        })
+        log("ELECTION", f"ELECTION_ACK enviado → {name}")
 
+        # Aguarda ACK do Master (timeout 5s — spec)
+        response = recv_json(conn, timeout=TCP_TIMEOUT)
+        if response is None:
+            log("FALLBACK", f"Timeout aguardando ELECTION_ACK de {name}. Reiniciando descoberta.")
+            conn.close()
+            return False
+
+        status = response.get("STATUS", "")
+        if status == "ACCEPTED":
+            log("ELECTION", f"✔ Conexão aceita por {name}. Iniciando Heartbeat e ciclo de tarefas.")
+            with state_lock:
+                current_master_host = host
+                current_master_port = port
+            conn.close()
+            return True
+        else:
+            log("FALLBACK", f"Master {name} rejeitou eleição (STATUS={status}). Reiniciando.")
+            conn.close()
+            return False
+
+    except Exception as e:
+        log("FALLBACK", f"Erro durante ELECTION_ACK com {name}: {e}. Reiniciando descoberta.")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+
+def ciclo_descoberta() -> bool:
+    """
+    Ciclo completo de descoberta + eleição + confirmação TCP.
+    Retorna True se o Worker está pronto para operar (master encontrado e aceito).
+    """
+    masters = descobrir_masters()
+
+    if not masters:
+        log("DISCOVERY", "NO_MASTER_FOUND — nenhum Master respondeu. Aplicando backoff.")
+        return False
+
+    log("ELECTION", f"{len(masters)} Master(s) encontrado(s): {[m['MASTER_NAME'] for m in masters]}")
+    eleito = eleger_master(masters)
+
+    if not eleito:
+        return False
+
+    return confirmar_eleicao_tcp(eleito)
+
+def loop_descoberta():
+    """
+    Tenta descobrir um Master em loop com backoff exponencial.
+    Só avança quando tiver um Master aceito.
+    """
+    retry_wait = 2
+    while True:
+        log("DISCOVERY", "Iniciando descoberta de Masters na rede...")
+        sucesso = ciclo_descoberta()
+        if sucesso:
+            log("DISCOVERY", f"Master configurado: {current_master_host}:{current_master_port}")
+            return
+        log("DISCOVERY", f"Tentando novamente em {retry_wait}s...")
+        time.sleep(retry_wait)
+        retry_wait = min(retry_wait * 2, MAX_RETRY_BACKOFF)
+
+# ═══════════════════════════════════════════════════════════════════
+# SPRINT 1 — HEARTBEAT
+# ═══════════════════════════════════════════════════════════════════
+
+def enviar_heartbeat() -> bool:
+    conn = criar_conexao_tcp()
+    if conn is None:
+        log("HEARTBEAT", "Status: OFFLINE - Tentando Reconectar")
+        return False
+    try:
+        send_json(conn, {"SERVER_UUID": WORKER_UUID, "TASK": "HEARTBEAT"})
+        response = recv_json(conn, timeout=TCP_TIMEOUT)
         if response and response.get("RESPONSE") == "ALIVE":
             log("HEARTBEAT", f"Status: ALIVE | master={current_master_host}:{current_master_port}")
             return True
-        else:
-            log("HEARTBEAT", f"Resposta inesperada: {response}")
-            return False
+        log("HEARTBEAT", f"Resposta inesperada: {response}")
+        return False
     except Exception as e:
         log("HEARTBEAT", f"Erro: {e}")
         return False
@@ -130,39 +267,47 @@ def enviar_heartbeat():
 
 def loop_heartbeat():
     """
-    Loop de heartbeat com backoff exponencial em caso de falha.
-    Reconecta automaticamente (spec: reestabelece sem travar).
+    Loop de heartbeat com backoff exponencial.
+    Se o Master cair, reinicia descoberta UDP.
     """
     retry_wait = TASK_INTERVAL
     while True:
+        if not current_master_host:
+            time.sleep(1)
+            continue
+
         sucesso = enviar_heartbeat()
         if sucesso:
-            retry_wait = TASK_INTERVAL   # reseta backoff
+            retry_wait = TASK_INTERVAL
             time.sleep(HEARTBEAT_INTERVAL)
         else:
             log("HEARTBEAT", f"Falha. Tentando novamente em {retry_wait}s...")
             time.sleep(retry_wait)
-            retry_wait = min(retry_wait * 2, MAX_RETRY_BACKOFF)   # backoff exponencial
+            retry_wait = min(retry_wait * 2, MAX_RETRY_BACKOFF)
+
+            # Se muitas falhas: reinicia descoberta UDP
+            if retry_wait >= MAX_RETRY_BACKOFF:
+                log("FALLBACK", "Master parece offline. Reiniciando descoberta UDP...")
+                with state_lock:
+                    pass  # reseta feito no loop_descoberta se chamado
+                loop_descoberta()
+                retry_wait = TASK_INTERVAL
 
 # ═══════════════════════════════════════════════════════════════════
 # SPRINT 2 — CICLO DE TAREFAS
 # ═══════════════════════════════════════════════════════════════════
 
 def processar_tarefa(user: str) -> str:
-    """
-    Simula processamento de tarefa.
-    Flag task_in_progress garante que redirects não interrompam o trabalho.
-    """
     global task_in_progress
     with state_lock:
         task_in_progress = True
     try:
         log("TASK", f"Processando: USER={user} ...")
-        time.sleep(2)   # simula trabalho (cálculo / I/O)
+        time.sleep(2)
         log("TASK", f"Concluído: USER={user}")
         return "OK"
     except Exception as e:
-        log("TASK", f"Erro ao processar: {e}")
+        log("TASK", f"Erro: {e}")
         return "NOK"
     finally:
         with state_lock:
@@ -170,82 +315,59 @@ def processar_tarefa(user: str) -> str:
 
 def executar_ciclo_tarefa(conn: socket.socket) -> str:
     """
-    Ciclo completo Sprint 2:
-      ALIVE → (QUERY | NO_TASK | command_redirect | command_release)
-      → STATUS → ACK
-
-    Retorna:
-      'done'     — ciclo concluído com sucesso
-      'no_task'  — sem tarefa disponível
-      'redirect' — recebeu command_redirect (Sprint 3)
-      'release'  — recebeu command_release (Sprint 3)
-      'error'    — falha de comunicação ou parsing
+    Ciclo completo: ALIVE → QUERY/NO_TASK/redirect/release → STATUS → ACK
     """
-    # ── Passo 1: Apresentação ──────────────────────────────
     with state_lock:
         orig_uuid = current_original_uuid
 
     payload_alive = {"WORKER": "ALIVE", "WORKER_UUID": WORKER_UUID}
     if orig_uuid:
-        payload_alive["SERVER_UUID"] = orig_uuid   # identifica como emprestado
+        payload_alive["SERVER_UUID"] = orig_uuid
 
     send_json(conn, payload_alive)
     log("ALIVE", "Apresentado" + (f" | emprestado de {orig_uuid}" if orig_uuid else " | local"))
 
-    # ── Passo 2: Aguarda resposta do Master ────────────────
-    response = recv_json(conn, timeout=TIMEOUT)
+    response = recv_json(conn, timeout=TCP_TIMEOUT)
     if response is None:
-        log("CICLO", "Sem resposta do Master (timeout ou desconexão).")
+        log("CICLO", "Sem resposta do Master (timeout).")
         return "error"
 
     log("RECEBIDO", str(response))
 
-    # ── Sprint 3: command_redirect ─────────────────────────
+    # Sprint 3: command_redirect
     if response.get("type") == "command_redirect":
         new_addr = response.get("payload", {}).get("new_master_address", "")
-        if not new_addr:
-            log("REDIRECT", "command_redirect sem new_master_address. Ignorado.")
-            return "error"
-        return tratar_command_redirect(new_addr)
+        return tratar_command_redirect(new_addr) if new_addr else "error"
 
-    # ── Sprint 3: command_release ──────────────────────────
+    # Sprint 3: command_release
     if response.get("type") == "command_release":
         orig_addr = response.get("payload", {}).get("original_master_address", "")
-        if not orig_addr:
-            log("RELEASE", "command_release sem original_master_address. Ignorado.")
-            return "error"
-        return tratar_command_release(orig_addr)
+        return tratar_command_release(orig_addr) if orig_addr else "error"
 
     task = response.get("TASK", "").upper()
 
-    # ── NO_TASK ────────────────────────────────────────────
     if task == "NO_TASK":
-        log("CICLO", "Sem tarefas disponíveis.")
+        log("CICLO", "Sem tarefas.")
         return "no_task"
 
-    # ── QUERY ──────────────────────────────────────────────
     if task == "QUERY":
         user = response.get("USER", "desconhecido")
-
         try:
             status = processar_tarefa(user)
         except Exception:
             status = "NOK"
 
-        # Passo 3: Reporta STATUS
         send_json(conn, {"STATUS": status, "TASK": "QUERY", "WORKER_UUID": WORKER_UUID})
         log("STATUS", f"Reportado: {status}")
 
-        # Passo 4: Aguarda ACK (spec: fecha o ciclo sem perda de mensagem)
-        ack = recv_json(conn, timeout=TIMEOUT)
+        ack = recv_json(conn, timeout=TCP_TIMEOUT)
         if ack and ack.get("STATUS") == "ACK":
-            log("ACK", "ACK recebido. Ciclo concluído com sucesso.")
+            log("ACK", "ACK recebido. Ciclo concluído.")
             return "done"
-        else:
-            log("ACK", f"ACK inesperado ou ausente: {ack}")
-            return "error"
+        log("ACK", f"ACK inesperado: {ack}")
+        return "error"
 
-    log("CICLO", f"Mensagem desconhecida recebida: {response}")
+    log("CICLO", f"Mensagem desconhecida: {response}")
     return "error"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -253,54 +375,34 @@ def executar_ciclo_tarefa(conn: socket.socket) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def tratar_command_redirect(new_master_address: str) -> str:
-    """
-    Recebe command_redirect do Master atual.
-    1. Guarda endereço do master anterior como "origem"
-    2. Atualiza current_master para o novo endereço
-    3. Envia register_temporary_worker ao novo master
-    """
     global current_master_host, current_master_port
-    global original_master_address, current_original_uuid
+    global original_master_addr, current_original_uuid
 
-    log("REDIRECT", f"command_redirect recebido → novo master: {new_master_address}")
-
+    log("REDIRECT", f"command_redirect → novo master: {new_master_address}")
     with state_lock:
-        # Salva o master atual como origem
-        original_master_address = f"{current_master_host}:{current_master_port}"
-        current_original_uuid   = original_master_address  # usado em SERVER_UUID
-
-        # Atualiza para o novo master
+        original_master_addr   = f"{current_master_host}:{current_master_port}"
+        current_original_uuid  = original_master_addr
         try:
-            new_host, new_port = new_master_address.rsplit(":", 1)
-            current_master_host = new_host
-            current_master_port = int(new_port)
+            new_host, new_port     = new_master_address.rsplit(":", 1)
+            current_master_host    = new_host
+            current_master_port    = int(new_port)
         except ValueError:
             log("REDIRECT", f"Endereço inválido: {new_master_address}")
             return "error"
 
-    log("REDIRECT",
-        f"Master atualizado: {current_master_host}:{current_master_port} | "
-        f"origem salva: {original_master_address}")
-
-    # Registra no novo master em thread separada (não bloqueia o ciclo)
+    log("REDIRECT", f"Novo master={current_master_host}:{current_master_port} | origem={original_master_addr}")
     threading.Thread(target=registrar_no_novo_master, daemon=True).start()
     return "redirect"
 
 def registrar_no_novo_master():
-    """
-    Envia register_temporary_worker ao novo Master (Sprint 3C).
-    Spec: imediatamente após conectar ao novo Master.
-    """
-    time.sleep(0.5)   # pequena pausa para o novo master estar pronto para aceitar
-    conn = criar_conexao()
+    time.sleep(0.5)
+    conn = criar_conexao_tcp()
     if conn is None:
-        log("REGISTER", "Falha ao conectar no novo Master para registro.")
+        log("REGISTER", "Falha ao conectar no novo Master.")
         return
-
     try:
         with state_lock:
-            orig_addr = original_master_address
-
+            orig_addr = original_master_addr
         req_id = str(uuid.uuid4())
         send_json(conn, {
             "type":       "register_temporary_worker",
@@ -310,11 +412,9 @@ def registrar_no_novo_master():
                 "original_master_address": orig_addr
             }
         })
-        log("REGISTER",
-            f"register_temporary_worker → {current_master_host}:{current_master_port} "
-            f"| origem={orig_addr} [req={req_id[:8]}]")
+        log("REGISTER", f"register_temporary_worker enviado | origem={orig_addr} [req={req_id[:8]}]")
     except Exception as e:
-        log("REGISTER", f"Erro ao registrar: {e}")
+        log("REGISTER", f"Erro: {e}")
     finally:
         try:
             conn.close()
@@ -322,30 +422,22 @@ def registrar_no_novo_master():
             pass
 
 def tratar_command_release(orig_addr: str) -> str:
-    """
-    Recebe command_release do Master que estava usando este worker.
-    Reseta estado para worker local e volta ao master de origem.
-
-    Spec CT08: worker detecta queda e tenta voltar ao master original.
-    """
     global current_master_host, current_master_port
-    global original_master_address, current_original_uuid
+    global original_master_addr, current_original_uuid
 
-    log("RELEASE", f"command_release recebido → retornando a {orig_addr}")
-
+    log("RELEASE", f"command_release → retornando a {orig_addr}")
     with state_lock:
         try:
-            host, port = orig_addr.rsplit(":", 1)
-            current_master_host     = host
-            current_master_port     = int(port)
-            original_master_address = None
-            current_original_uuid   = None   # volta a ser worker local
+            host, port             = orig_addr.rsplit(":", 1)
+            current_master_host    = host
+            current_master_port    = int(port)
+            original_master_addr   = None
+            current_original_uuid  = None
         except ValueError:
             log("RELEASE", f"Endereço inválido: {orig_addr}")
             return "error"
 
-    log("RELEASE",
-        f"Estado resetado. Master atual: {current_master_host}:{current_master_port} | Modo: LOCAL")
+    log("RELEASE", f"Resetado. Master={current_master_host}:{current_master_port} | Modo=LOCAL")
     return "release"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -353,40 +445,41 @@ def tratar_command_release(orig_addr: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 def loop_tarefas():
-    """
-    Loop principal: conecta ao master atual e executa o ciclo de tarefa.
-    Trata todos os resultados possíveis do ciclo.
-
-    Spec CT08: se master cair durante empréstimo, worker tenta voltar ao original.
-    """
     retry_wait = TASK_INTERVAL
-
     while True:
-        conn = criar_conexao()
+        if not current_master_host:
+            time.sleep(1)
+            continue
+
+        conn = criar_conexao_tcp()
         if conn is None:
             with state_lock:
                 is_borrowed = current_original_uuid is not None
-                orig_addr   = original_master_address
+                orig_addr   = original_master_addr
 
+            # Spec CT08: se master cair durante empréstimo, volta ao original
             if is_borrowed and orig_addr:
-                # Spec CT08: master atual caiu durante empréstimo → volta ao original
-                log("LOOP",
-                    f"Master atual indisponível. Sou emprestado. "
-                    f"Tentando voltar ao master original: {orig_addr}")
+                log("LOOP", f"Master caiu durante empréstimo. Voltando ao original: {orig_addr}")
                 tratar_command_release(orig_addr)
                 retry_wait = TASK_INTERVAL
             else:
                 log("LOOP", f"Master indisponível. Aguardando {retry_wait}s...")
                 time.sleep(retry_wait)
                 retry_wait = min(retry_wait * 2, MAX_RETRY_BACKOFF)
+
+                # Reinicia descoberta se master estiver muito tempo offline
+                if retry_wait >= MAX_RETRY_BACKOFF:
+                    log("FALLBACK", "Reiniciando descoberta UDP...")
+                    loop_descoberta()
+                    retry_wait = TASK_INTERVAL
             continue
 
-        retry_wait = TASK_INTERVAL   # reseta backoff ao conectar com sucesso
+        retry_wait = TASK_INTERVAL
 
         try:
             resultado = executar_ciclo_tarefa(conn)
         except Exception as e:
-            log("LOOP", f"Exceção inesperada no ciclo: {e}")
+            log("LOOP", f"Exceção no ciclo: {e}")
             resultado = "error"
         finally:
             try:
@@ -396,24 +489,16 @@ def loop_tarefas():
 
         if resultado == "done":
             time.sleep(TASK_INTERVAL)
-
         elif resultado == "no_task":
-            log("LOOP", f"Sem tarefas. Aguardando {TASK_INTERVAL}s...")
             time.sleep(TASK_INTERVAL)
-
         elif resultado == "redirect":
-            # Redirecionado: aguarda registro ser concluído e reconecta
-            log("LOOP", "Redirecionado para novo master. Reconectando em 1s...")
+            log("LOOP", "Redirecionado. Reconectando ao novo master...")
             time.sleep(1)
-
         elif resultado == "release":
-            # Devolvido: volta ao master original normalmente
-            log("LOOP", "Devolvido ao master original. Retomando ciclo normal.")
+            log("LOOP", "Devolvido ao master original.")
             time.sleep(TASK_INTERVAL)
-
         else:
-            # Erro: backoff antes de tentar novamente
-            log("LOOP", f"Erro no ciclo. Aguardando {retry_wait}s antes de reconectar...")
+            log("LOOP", f"Erro. Aguardando {retry_wait}s...")
             time.sleep(retry_wait)
             retry_wait = min(retry_wait * 2, MAX_RETRY_BACKOFF)
 
@@ -423,13 +508,13 @@ def loop_tarefas():
 
 if __name__ == "__main__":
     log("WORKER", f"Iniciando | UUID={WORKER_UUID}")
-    log("WORKER", f"Master inicial: {MASTER_HOST}:{MASTER_PORT}")
-    log("WORKER", "Modo: " + (
-        f"EMPRESTADO (origem: {ORIGINAL_MASTER_UUID})" if ORIGINAL_MASTER_UUID else "LOCAL"
-    ))
+    log("WORKER", "Modo: DESCOBERTA DINÂMICA — sem IP pré-configurado")
 
-    # Thread de heartbeat — paralela ao ciclo de tarefas
+    # Passo 1: Descobre e conecta ao Master via UDP
+    loop_descoberta()
+
+    # Passo 2: Thread de heartbeat em paralelo
     threading.Thread(target=loop_heartbeat, daemon=True).start()
 
-    # Loop principal de tarefas (bloqueante)
+    # Passo 3: Loop principal de tarefas
     loop_tarefas()

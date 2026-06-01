@@ -1,6 +1,6 @@
 """
-master.py — Sistema P2P com Balanceamento de Carga Dinâmico
-Sprint 1 + Sprint 2 + Sprint 3 completos
+master.py — Sprint 2.1 + Sprint 1 + Sprint 2 + Sprint 3
+Descoberta Dinâmica via UDP + Balanceamento de Carga P2P
 """
 
 import socket
@@ -11,7 +11,7 @@ import time
 import uuid
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIGURAÇÕES — ajuste antes de rodar
+# CONFIGURAÇÕES
 # ═══════════════════════════════════════════════════════════════════
 
 def get_local_ip():
@@ -22,31 +22,30 @@ def get_local_ip():
     finally:
         s.close()
 
-HOST      = "192.168.1.97"
+HOST      = get_local_ip()
 PORT      = 8000
-MASTER_ID = "Master-A"
-NEIGHBOR_MASTERS = [("Master-B", "192.168.1.97", 8001)]   # ← mude para "Master-B" na segunda máquina
+MASTER_ID = "Master-A"   # ← mude para "Master-B" na segunda máquina
 
-# Thresholds (histerese obrigatória da spec)
-CAPACITY          = 10   # acima disso: saturado → pede ajuda
-RELEASE_THRESHOLD = 5    # abaixo disso: devolve workers emprestados
+# Porta dedicada para descoberta UDP (igual em todos os nós)
+UDP_DISCOVERY_PORT = 5000
 
+# Thresholds
+CAPACITY          = 10
+RELEASE_THRESHOLD = 5
 
-NEGOTIATION_TIMEOUT = 5   # spec: aguarda 5s antes de considerar indisponível
+# Vizinhos Masters (para Sprint 3)
+NEIGHBOR_MASTERS = []
+
+NEGOTIATION_TIMEOUT = 5
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTADO GLOBAL (protegido por locks)
+# ESTADO GLOBAL
 # ═══════════════════════════════════════════════════════════════════
 
 state_lock       = threading.Lock()
 task_queue       = queue.Queue()
-
-# {worker_uuid: {"conn": conn, "addr": addr, "busy": bool}}
 workers_local    = {}
-
-# {worker_uuid: {"conn": conn, "original_master": "ip:port"}}
 workers_borrowed = {}
-
 load_counter     = 0
 saturated        = False
 
@@ -55,17 +54,12 @@ saturated        = False
 # ═══════════════════════════════════════════════════════════════════
 
 def send_json(conn, data: dict):
-    """Envia dict como JSON terminado com \\n (obrigatório pela spec)."""
     try:
         conn.sendall((json.dumps(data) + "\n").encode("utf-8"))
     except Exception as e:
         log("REDE", f"Erro ao enviar: {e}")
 
 def recv_json(conn, timeout=None) -> dict | None:
-    """
-    Recebe dados acumulando buffer até encontrar \\n.
-    Garante que mensagens fragmentadas em TCP não se percam.
-    """
     buf = b""
     original_timeout = conn.gettimeout()
     if timeout is not None:
@@ -81,36 +75,125 @@ def recv_json(conn, timeout=None) -> dict | None:
                 return json.loads(line.decode("utf-8"))
     except socket.timeout:
         return None
-    except json.JSONDecodeError as e:
-        log("PARSE", f"JSON inválido: {e} | raw={buf[:200]}")
-        return None
-    except OSError:
+    except (json.JSONDecodeError, OSError):
         return None
     finally:
         conn.settimeout(original_timeout)
 
 def log(tag: str, msg: str, req_id: str = ""):
-    """Log com timestamp, MASTER_ID, tag e request_id opcional."""
     ts      = time.strftime("%H:%M:%S")
     req_str = f"[req={req_id[:8]}]" if req_id else ""
     print(f"[{ts}][{MASTER_ID}][{tag}]{req_str} {msg}", flush=True)
 
 def log_worker_state():
-    """Exibe contador de workers a cada mudança (requisito de observabilidade)."""
     with state_lock:
-        locais     = len(workers_local)
+        locais      = len(workers_local)
         emprestados = len(workers_borrowed)
     log("WORKERS", f"Locais={locais} | Emprestados={emprestados} | Fila={task_queue.qsize()}")
 
 def strict_parse(payload: dict, required_fields: list, context: str) -> bool:
-    """
-    Strict parsing: loga erro e retorna False se campo obrigatório ausente.
-    Campos desconhecidos são ignorados silenciosamente (compatibilidade futura).
-    """
     for field in required_fields:
         if field not in payload:
-            log("PARSE_ERR", f"[{context}] Campo obrigatório ausente: '{field}' | payload={payload}")
+            log("PARSE_ERR", f"[{context}] Campo obrigatório ausente: '{field}'")
             return False
+    return True
+
+# ═══════════════════════════════════════════════════════════════════
+# SPRINT 2.1 — DESCOBERTA UDP
+# ═══════════════════════════════════════════════════════════════════
+
+def iniciar_servidor_udp():
+    """
+    Escuta broadcasts/multicasts UDP de Workers buscando Masters.
+    Responde com DISCOVERY_REPLY via UDP Unicast para o Worker.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", UDP_DISCOVERY_PORT))
+
+    log("DISCOVERY", f"Escutando UDP na porta {UDP_DISCOVERY_PORT}")
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            threading.Thread(
+                target=tratar_discovery_udp,
+                args=(sock, data, addr),
+                daemon=True
+            ).start()
+        except Exception as e:
+            log("DISCOVERY", f"Erro UDP: {e}")
+
+def tratar_discovery_udp(sock, data: bytes, addr: tuple):
+    """
+    Processa pacote DISCOVERY do Worker.
+    Responde via UDP Unicast com IP e porta TCP deste Master.
+    Strict parsing: ignora campos desconhecidos, loga se obrigatório ausente.
+    """
+    try:
+        raw = data.decode("utf-8").strip()
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        log("DISCOVERY", f"Payload malformado de {addr} — descartado.")
+        return
+
+    msg_type    = payload.get("TYPE", "")
+    worker_uuid = payload.get("WORKER_UUID", "")
+
+    if msg_type != "DISCOVERY":
+        return
+
+    if not worker_uuid:
+        log("DISCOVERY", f"WORKER_UUID ausente em DISCOVERY de {addr} — descartado.")
+        return
+
+    log("DISCOVERY", f"DISCOVERY recebido de Worker={worker_uuid} | {addr}")
+
+    response = {
+        "TYPE":        "DISCOVERY_REPLY",
+        "MASTER_NAME": MASTER_ID,
+        "MASTER_IP":   HOST,
+        "MASTER_PORT": PORT,
+        "STATUS":      "AVAILABLE"
+    }
+    msg = (json.dumps(response) + "\n").encode("utf-8")
+    sock.sendto(msg, addr)
+    log("DISCOVERY", f"DISCOVERY_REPLY enviado para {addr} | master={MASTER_ID} ip={HOST}:{PORT}")
+
+# ═══════════════════════════════════════════════════════════════════
+# SPRINT 2.1 — ELECTION ACK (TCP)
+# ═══════════════════════════════════════════════════════════════════
+
+def handle_election_ack(conn, payload: dict) -> bool:
+    """
+    Worker conectou via TCP após eleição e confirma o Master eleito.
+    Master valida e responde com ELECTION_ACK ACCEPTED.
+    Retorna True se o Worker deve continuar com Heartbeat/tarefas.
+    """
+    if not strict_parse(payload, ["TYPE", "WORKER_UUID", "SELECTED_MASTER"], "ELECTION_ACK"):
+        return False
+
+    worker_uuid      = payload["WORKER_UUID"]
+    selected_master  = payload["SELECTED_MASTER"]
+
+    # Valida se o Worker elegeu este Master
+    if selected_master != MASTER_ID:
+        log("ELECTION",
+            f"Worker {worker_uuid} elegeu '{selected_master}' mas conectou em '{MASTER_ID}'. "
+            f"Rejeitando.")
+        send_json(conn, {
+            "TYPE":        "ELECTION_ACK",
+            "STATUS":      "REJECTED",
+            "MASTER_NAME": MASTER_ID
+        })
+        return False
+
+    send_json(conn, {
+        "TYPE":        "ELECTION_ACK",
+        "STATUS":      "ACCEPTED",
+        "MASTER_NAME": MASTER_ID
+    })
+    log("ELECTION", f"Worker {worker_uuid} conectado e aceito após eleição.")
     return True
 
 # ═══════════════════════════════════════════════════════════════════
@@ -125,10 +208,6 @@ def populate_queue(n=20):
     log("FILA", f"{task_queue.qsize()} tarefas adicionadas.")
 
 def monitor_load():
-    """
-    Monitora carga continuamente.
-    Dispara pedido de ajuda ou devolução com histerese.
-    """
     global load_counter, saturated
     while True:
         time.sleep(3)
@@ -136,7 +215,7 @@ def monitor_load():
             load_counter = task_queue.qsize()
 
         log("CARGA",
-            f"Pendentes={load_counter} | Saturação>{CAPACITY} | Liberação<{RELEASE_THRESHOLD} | "
+            f"Pendentes={load_counter} | Sat>{CAPACITY} | Lib<{RELEASE_THRESHOLD} | "
             f"Locais={len(workers_local)} | Emprestados={len(workers_borrowed)}")
 
         if load_counter > CAPACITY and not saturated:
@@ -156,30 +235,25 @@ def monitor_load():
 # ═══════════════════════════════════════════════════════════════════
 
 def handle_heartbeat(conn, payload: dict):
-    """Worker verifica se o Master está ativo."""
     if not strict_parse(payload, ["SERVER_UUID", "TASK"], "HEARTBEAT"):
         return
     send_json(conn, {
         "SERVER_UUID": MASTER_ID,
-        "TASK": "HEARTBEAT",
-        "RESPONSE": "ALIVE"
+        "TASK":        "HEARTBEAT",
+        "RESPONSE":    "ALIVE"
     })
     log("HEARTBEAT", f"ALIVE → {payload['SERVER_UUID']}")
 
 # ═══════════════════════════════════════════════════════════════════
-# SPRINT 2 — CICLO DE TAREFAS (Worker → Master)
+# SPRINT 2 — CICLO DE TAREFAS
 # ═══════════════════════════════════════════════════════════════════
 
 def handle_worker_alive(conn, payload: dict):
-    """
-    Worker se apresenta pedindo tarefa.
-    Campo SERVER_UUID presente = worker emprestado.
-    """
     if not strict_parse(payload, ["WORKER", "WORKER_UUID"], "WORKER_ALIVE"):
         return
 
     worker_uuid     = payload["WORKER_UUID"]
-    original_master = payload.get("SERVER_UUID")  # opcional — só emprestados
+    original_master = payload.get("SERVER_UUID")
 
     with state_lock:
         if original_master:
@@ -191,7 +265,6 @@ def handle_worker_alive(conn, payload: dict):
 
     log_worker_state()
 
-    # Distribui tarefa ou informa que não há
     if not task_queue.empty():
         user = task_queue.get()
         send_json(conn, {"TASK": "QUERY", "USER": user})
@@ -201,10 +274,6 @@ def handle_worker_alive(conn, payload: dict):
         log("TASK", f"NO_TASK → {worker_uuid}")
 
 def handle_status(conn, payload: dict):
-    """
-    Recebe resultado de tarefa (OK ou NOK) e envia ACK.
-    Spec: ACK deve ser enviado mesmo para NOK.
-    """
     if not strict_parse(payload, ["STATUS", "TASK", "WORKER_UUID"], "STATUS"):
         return
 
@@ -212,53 +281,37 @@ def handle_status(conn, payload: dict):
     status      = payload["STATUS"].upper()
 
     if status not in ("OK", "NOK"):
-        log("PARSE_ERR", f"STATUS inválido: '{status}' de {worker_uuid}")
+        log("PARSE_ERR", f"STATUS inválido: '{status}'")
         return
 
     origem = "EMPRESTADO" if worker_uuid in workers_borrowed else "LOCAL"
-    log("STATUS", f"{worker_uuid} ({origem}) → {status} | tarefa concluída")
+    log("STATUS", f"{worker_uuid} ({origem}) → {status}")
 
-    # ACK obrigatório mesmo para NOK (spec CT05)
     send_json(conn, {"STATUS": "ACK", "WORKER_UUID": worker_uuid})
     log("ACK", f"ACK → {worker_uuid}")
 
 # ═══════════════════════════════════════════════════════════════════
-# SPRINT 3A — ESTE MASTER SATURADO: solicita workers
+# SPRINT 3 — NEGOCIAÇÃO MASTER-TO-MASTER
 # ═══════════════════════════════════════════════════════════════════
 
 def solicitar_ajuda():
-    """
-    Tenta cada vizinho em ordem até conseguir ajuda ou esgotar a lista.
-    Cada tentativa tem timeout de 5s (spec).
-    """
     with state_lock:
         workers_needed = max(1, (load_counter - CAPACITY) // 2 + 1)
-
-    log("NEG", f"Buscando {workers_needed} worker(s) emprestado(s).")
-
+    log("NEG", f"Buscando {workers_needed} worker(s).")
     for (neighbor_id, neighbor_ip, neighbor_port) in NEIGHBOR_MASTERS:
-        sucesso = pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed)
-        if sucesso:
-            log("NEG", f"Ajuda obtida de {neighbor_id}.")
+        if pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed):
             return
+    log("NEG", "Nenhum vizinho disponível.")
 
-    log("NEG", "Nenhum vizinho disponível para ajudar.")
-
-def pedir_ao_vizinho(neighbor_id: str, neighbor_ip: str, neighbor_port: int, workers_needed: int) -> bool:
-    """
-    Abre conexão TCP com vizinho, envia request_help com UUID v4,
-    aguarda response_accepted ou response_rejected (timeout 5s).
-    Valida correlação de request_id.
-    """
+def pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed) -> bool:
     request_id = str(uuid.uuid4())
     log("REQUEST_HELP", f"→ {neighbor_id} ({neighbor_ip}:{neighbor_port})", req_id=request_id)
-
     try:
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.settimeout(NEGOTIATION_TIMEOUT)
         conn.connect((neighbor_ip, neighbor_port))
     except Exception as e:
-        log("REQUEST_HELP", f"Falha ao conectar com {neighbor_id}: {e} | descartando req", req_id=request_id)
+        log("REQUEST_HELP", f"Falha ao conectar com {neighbor_id}: {e}", req_id=request_id)
         return False
 
     try:
@@ -273,71 +326,48 @@ def pedir_ao_vizinho(neighbor_id: str, neighbor_ip: str, neighbor_port: int, wor
                 "workers_needed": workers_needed
             }
         })
-
         response = recv_json(conn, timeout=NEGOTIATION_TIMEOUT)
     finally:
         conn.close()
 
-    # Timeout — spec CT07: descarta request_id, loga e tenta próximo vizinho
     if response is None:
-        log("REQUEST_HELP",
-            f"Timeout aguardando {neighbor_id}. request_id descartado. Tentando próximo vizinho.",
-            req_id=request_id)
+        log("REQUEST_HELP", f"Timeout. request_id descartado. Tentando próximo.", req_id=request_id)
         return False
 
-    r_type    = response.get("type", "")
-    r_req_id  = response.get("request_id", "")
+    r_type   = response.get("type", "")
+    r_req_id = response.get("request_id", "")
     r_payload = response.get("payload", {})
 
-    # Valida correlação de request_id (spec CT03)
     if r_req_id != request_id:
-        log("REQUEST_HELP",
-            f"request_id divergente! esperado={request_id[:8]} recebido={r_req_id[:8]}. Ignorando.",
-            req_id=request_id)
+        log("REQUEST_HELP", f"request_id divergente. Ignorando.", req_id=request_id)
         return False
 
     if r_type == "response_accepted":
-        offered = r_payload.get("workers_offered", 0)
-        details = r_payload.get("worker_details", [])
-        log("RESPONSE", f"✔ {neighbor_id} aceitou: {offered} worker(s) {details}", req_id=request_id)
+        log("RESPONSE", f"✔ {neighbor_id} aceitou: {r_payload.get('workers_offered')} worker(s)", req_id=request_id)
         return True
-
     elif r_type == "response_rejected":
-        reason = r_payload.get("reason", "?")
-        log("RESPONSE", f"✘ {neighbor_id} recusou: reason={reason}", req_id=request_id)
+        log("RESPONSE", f"✘ {neighbor_id} recusou: {r_payload.get('reason')}", req_id=request_id)
         return False
 
-    log("RESPONSE", f"Tipo desconhecido '{r_type}' de {neighbor_id}. Ignorado.", req_id=request_id)
     return False
 
-# ═══════════════════════════════════════════════════════════════════
-# SPRINT 3B — ESTE MASTER COMO OFERTANTE: responde ao vizinho
-# ═══════════════════════════════════════════════════════════════════
-
 def handle_request_help(conn, payload_outer: dict):
-    """
-    Recebe request_help de vizinho saturado.
-    Avalia carga + workers ociosos e responde accepted ou rejected.
-    Mantém o mesmo request_id na resposta (spec CT03).
-    """
-    request_id     = payload_outer.get("request_id", str(uuid.uuid4()))
-    p              = payload_outer.get("payload", {})
-
+    request_id    = payload_outer.get("request_id", str(uuid.uuid4()))
+    p             = payload_outer.get("payload", {})
     if not strict_parse(p, ["master_id", "master_address", "workers_needed"], "request_help"):
         return
 
-    requester_id   = p["master_id"]
+    requester_id  = p["master_id"]
     requester_addr = p["master_address"]
-    needed         = int(p["workers_needed"])
+    needed        = int(p["workers_needed"])
 
     log("REQUEST_HELP", f"← {requester_id} pediu {needed} worker(s)", req_id=request_id)
 
     with state_lock:
         my_load      = load_counter
         idle_workers = list(workers_local.keys())
-        can_offer    = max(0, len(idle_workers) - 1)  # mantém pelo menos 1 local
+        can_offer    = max(0, len(idle_workers) - 1)
 
-    # Decide motivo de rejeição
     if my_load >= CAPACITY:
         reason = "high_load"
     elif can_offer == 0:
@@ -346,47 +376,25 @@ def handle_request_help(conn, payload_outer: dict):
         reason = None
 
     if reason:
-        send_json(conn, {
-            "type":       "response_rejected",
-            "request_id": request_id,
-            "payload":    {"reason": reason}
-        })
+        send_json(conn, {"type": "response_rejected", "request_id": request_id, "payload": {"reason": reason}})
         log("RESPONSE", f"Rejeitando {requester_id}: {reason}", req_id=request_id)
         return
 
-    # Aceita e seleciona workers
     to_offer = min(needed, can_offer)
     selected = idle_workers[:to_offer]
-
-    details = [{"id": wid, "address": f"{HOST}:{PORT}"} for wid in selected]
+    details  = [{"id": wid, "address": f"{HOST}:{PORT}"} for wid in selected]
 
     send_json(conn, {
-        "type":       "response_accepted",
+        "type": "response_accepted",
         "request_id": request_id,
-        "payload": {
-            "workers_offered": to_offer,
-            "worker_details":  details
-        }
+        "payload": {"workers_offered": to_offer, "worker_details": details}
     })
-    log("RESPONSE",
-        f"✔ Aceitando {requester_id}: {to_offer} worker(s) → {[d['id'] for d in details]}",
-        req_id=request_id)
+    log("RESPONSE", f"✔ Aceitando {requester_id}: {to_offer} worker(s)", req_id=request_id)
 
-    # Envia command_redirect para cada worker selecionado (em threads paralelas)
     for wid in selected:
-        threading.Thread(
-            target=enviar_command_redirect,
-            args=(wid, requester_addr),
-            daemon=True
-        ).start()
+        threading.Thread(target=enviar_command_redirect, args=(wid, requester_addr), daemon=True).start()
 
 def enviar_command_redirect(worker_uuid: str, new_master_address: str):
-    """
-    Instrui um worker local a se reconectar ao Master saturado.
-    Spec: worker deve finalizar tarefa em execução antes de desconectar
-    (aguardamos até busy=False com timeout).
-    """
-    # Aguarda worker terminar tarefa atual (máx 10s)
     deadline = time.time() + 10
     while time.time() < deadline:
         with state_lock:
@@ -397,140 +405,87 @@ def enviar_command_redirect(worker_uuid: str, new_master_address: str):
 
     with state_lock:
         info = workers_local.get(worker_uuid)
-
     if not info:
-        log("REDIRECT", f"Worker {worker_uuid} não encontrado.")
         return
 
-    conn       = info["conn"]
     req_id_red = str(uuid.uuid4())
-
-    send_json(conn, {
-        "type":       "command_redirect",
+    send_json(info["conn"], {
+        "type": "command_redirect",
         "request_id": req_id_red,
-        "payload":    {"new_master_address": new_master_address}
+        "payload": {"new_master_address": new_master_address}
     })
-    log("REDIRECT",
-        f"command_redirect → {worker_uuid} | novo master={new_master_address}",
-        req_id=req_id_red)
-
+    log("REDIRECT", f"command_redirect → {worker_uuid} | {new_master_address}", req_id=req_id_red)
     with state_lock:
         workers_local.pop(worker_uuid, None)
-
     log_worker_state()
-
-# ═══════════════════════════════════════════════════════════════════
-# SPRINT 3C — REGISTRO DE WORKER TEMPORÁRIO
-# ═══════════════════════════════════════════════════════════════════
 
 def handle_register_temporary_worker(conn, payload_outer: dict):
-    """
-    Worker emprestado chegou e se registra neste Master.
-    Ciclo de vida completo é logado (requisito de observabilidade).
-    A partir daqui o worker opera pelo protocolo Sprint 2 com SERVER_UUID.
-    """
     request_id = payload_outer.get("request_id", "?")
     p          = payload_outer.get("payload", {})
-
     if not strict_parse(p, ["worker_id", "original_master_address"], "register_temporary_worker"):
         return
-
     worker_id = p["worker_id"]
     origin    = p["original_master_address"]
-
     with state_lock:
         workers_borrowed[worker_id] = {"conn": conn, "original_master": origin}
-
-    log("CICLO_VIDA",
-        f"[INÍCIO] Worker emprestado {worker_id} registrado | origem={origin}",
-        req_id=request_id)
+    log("CICLO_VIDA", f"[INÍCIO] Worker emprestado {worker_id} | origem={origin}", req_id=request_id)
     log_worker_state()
-
-# ═══════════════════════════════════════════════════════════════════
-# SPRINT 3D — DEVOLUÇÃO DOS WORKERS
-# ═══════════════════════════════════════════════════════════════════
 
 def devolver_todos_workers():
-    """Carga normalizou: devolve todos os workers emprestados."""
     with state_lock:
         to_return = dict(workers_borrowed)
-
     if not to_return:
         return
-
     log("DEVOLUÇÃO", f"Devolvendo {len(to_return)} worker(s).")
-
     for worker_id, info in to_return.items():
-        conn   = info["conn"]
-        origin = info["original_master"]
-        enviar_command_release(worker_id, conn, origin)
+        enviar_command_release(worker_id, info["conn"], info["original_master"])
 
-def enviar_command_release(worker_id: str, conn, original_master_address: str):
-    """Instrui worker emprestado a voltar ao Master de origem."""
+def enviar_command_release(worker_id, conn, original_master_address):
     req_id_rel = str(uuid.uuid4())
-
     send_json(conn, {
-        "type":       "command_release",
+        "type": "command_release",
         "request_id": req_id_rel,
-        "payload":    {"original_master_address": original_master_address}
+        "payload": {"original_master_address": original_master_address}
     })
-    log("RELEASE",
-        f"command_release → {worker_id} | retornar a {original_master_address}",
-        req_id=req_id_rel)
-
+    log("RELEASE", f"command_release → {worker_id} | retornar a {original_master_address}", req_id=req_id_rel)
     with state_lock:
         workers_borrowed.pop(worker_id, None)
-
     log("CICLO_VIDA", f"[FIM] Worker emprestado {worker_id} devolvido a {original_master_address}")
     log_worker_state()
+    threading.Thread(target=notify_worker_returned, args=(worker_id, original_master_address), daemon=True).start()
 
-    # Notifica Master de origem em paralelo
-    threading.Thread(
-        target=notify_worker_returned,
-        args=(worker_id, original_master_address),
-        daemon=True
-    ).start()
-
-def notify_worker_returned(worker_id: str, original_master_address: str):
-    """Envia notify_worker_returned ao Master de origem."""
+def notify_worker_returned(worker_id, original_master_address):
     req_id_ntf = str(uuid.uuid4())
     try:
         ip, port = original_master_address.rsplit(":", 1)
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.settimeout(NEGOTIATION_TIMEOUT)
         conn.connect((ip, int(port)))
-
         send_json(conn, {
-            "type":       "notify_worker_returned",
+            "type": "notify_worker_returned",
             "request_id": req_id_ntf,
-            "payload":    {"worker_id": worker_id}
+            "payload": {"worker_id": worker_id}
         })
-        log("NOTIFY",
-            f"notify_worker_returned → {original_master_address} | worker={worker_id}",
-            req_id=req_id_ntf)
+        log("NOTIFY", f"notify_worker_returned → {original_master_address} | worker={worker_id}", req_id=req_id_ntf)
         conn.close()
     except Exception as e:
-        log("NOTIFY", f"Falha ao notificar devolução de {worker_id}: {e}")
+        log("NOTIFY", f"Falha: {e}")
 
 def handle_notify_worker_returned(payload_outer: dict):
-    """Recebe notificação de que worker emprestado foi devolvido."""
-    p         = payload_outer.get("payload", {})
-    worker_id = p.get("worker_id", "?")
-    req_id    = payload_outer.get("request_id", "")
-    log("NOTIFY",
-        f"Worker {worker_id} devolvido. Aguardando reconexão via Sprint 2.",
-        req_id=req_id)
+    worker_id = payload_outer.get("payload", {}).get("worker_id", "?")
+    log("NOTIFY", f"Worker {worker_id} devolvido. Aguardando reconexão.")
 
 # ═══════════════════════════════════════════════════════════════════
-# DISPATCHER CENTRAL
+# DISPATCHER
 # ═══════════════════════════════════════════════════════════════════
 
 def dispatch(conn, payload: dict):
-    """
-    Roteia mensagem para o handler correto.
-    Campos desconhecidos são ignorados (spec: strict parsing sem derrubar processo).
-    """
-    # Sprint 1/2: identificados por campos em CAIXA ALTA
+    # Sprint 2.1 — Election ACK (primeira mensagem TCP após eleição)
+    if payload.get("TYPE") == "ELECTION_ACK" and "SELECTED_MASTER" in payload:
+        handle_election_ack(conn, payload)
+        return
+
+    # Sprint 1/2
     task         = payload.get("TASK", "").upper()
     worker_field = payload.get("WORKER", "").upper()
     status_field = payload.get("STATUS", "").upper()
@@ -545,9 +500,8 @@ def dispatch(conn, payload: dict):
         handle_status(conn, payload)
         return
 
-    # Sprint 3: identificados pelo campo "type" em minúsculas
+    # Sprint 3
     msg_type = payload.get("type", "").lower()
-
     handlers_s3 = {
         "request_help":               lambda: handle_request_help(conn, payload),
         "register_temporary_worker":  lambda: handle_register_temporary_worker(conn, payload),
@@ -557,21 +511,16 @@ def dispatch(conn, payload: dict):
     if msg_type in handlers_s3:
         handlers_s3[msg_type]()
     elif msg_type:
-        # Spec: tipo desconhecido → loga e ignora sem derrubar (CT09)
-        log("AVISO", f"Tipo desconhecido '{msg_type}' — ignorado silenciosamente.")
+        log("AVISO", f"Tipo desconhecido '{msg_type}' — ignorado.")
     else:
         log("AVISO", f"Mensagem sem tipo reconhecido — ignorada: {payload}")
 
 # ═══════════════════════════════════════════════════════════════════
-# THREAD DE ATENDIMENTO DE CLIENTE
+# THREAD DE CLIENTE TCP
 # ═══════════════════════════════════════════════════════════════════
 
 def handle_client(conn, addr):
-    """
-    Mantém conexão persistente com um cliente (worker ou master vizinho).
-    Loop infinito lendo mensagens até desconexão.
-    """
-    log("CONEXÃO", f"Nova conexão de {addr}")
+    log("CONEXÃO", f"Nova conexão TCP de {addr}")
     try:
         while True:
             payload = recv_json(conn)
@@ -583,40 +532,32 @@ def handle_client(conn, addr):
     except Exception as e:
         log("ERRO", f"[{addr}] {e}")
     finally:
-        # Spec CT08: se worker emprestado perder conexão com este master,
-        # remove do registro para que o master de origem possa recuperá-lo
         _limpar_worker_desconectado(conn)
         conn.close()
 
 def _limpar_worker_desconectado(conn):
-    """Remove worker do estado ao desconectar inesperadamente."""
     with state_lock:
-        # Verifica workers locais
         for wid, info in list(workers_local.items()):
             if info.get("conn") is conn:
                 workers_local.pop(wid)
                 log("CLEANUP", f"Worker local {wid} removido por desconexão.")
                 break
-        # Verifica workers emprestados
         for wid, info in list(workers_borrowed.items()):
             if info.get("conn") is conn:
                 workers_borrowed.pop(wid)
-                log("CLEANUP",
-                    f"Worker emprestado {wid} removido por desconexão. "
-                    f"Ele tentará reconectar ao master original.")
+                log("CLEANUP", f"Worker emprestado {wid} removido por desconexão.")
                 break
 
 # ═══════════════════════════════════════════════════════════════════
-# SERVIDOR PRINCIPAL
+# SERVIDOR TCP
 # ═══════════════════════════════════════════════════════════════════
 
-def iniciar_servidor():
+def iniciar_servidor_tcp():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
     srv.listen()
-    log("MASTER", f"Ouvindo em {HOST}:{PORT}")
-
+    log("MASTER", f"Servidor TCP ouvindo em {HOST}:{PORT}")
     while True:
         conn, addr = srv.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
@@ -631,5 +572,11 @@ if __name__ == "__main__":
     log("MASTER", f"Saturação>{CAPACITY} | Liberação<{RELEASE_THRESHOLD}")
     log("MASTER", f"Vizinhos: {NEIGHBOR_MASTERS if NEIGHBOR_MASTERS else 'nenhum configurado'}")
 
+    # Thread UDP — descoberta de workers
+    threading.Thread(target=iniciar_servidor_udp, daemon=True).start()
+
+    # Thread de monitoramento de carga
     threading.Thread(target=monitor_load, daemon=True).start()
-    iniciar_servidor()
+
+    # Servidor TCP principal (bloqueante)
+    iniciar_servidor_tcp()
