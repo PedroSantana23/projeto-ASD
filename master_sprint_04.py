@@ -136,8 +136,12 @@ tasks_failed    = 0
 
 state_lock       = threading.Lock()
 task_queue       = queue.Queue()
-workers_local    = {}
-workers_borrowed = {}
+workers_local    = {}       # workers nativos deste master
+workers_borrowed = {}       # workers recebidos de outro master (direction: "in")
+workers_lent_out = {}       # workers nativos emprestados para outro master (direction: "out")
+                            # formato: {worker_id: {"peer_master": "ID_DO_MASTER_DESTINO"}}
+workers_failed_count = 0    # workers que falharam
+task_queue_timestamps = []  # lista de timestamps (float) de quando cada tarefa entrou na fila
 load_counter     = 0
 saturated        = False
 
@@ -241,53 +245,69 @@ def coletar_estado_farm() -> dict:
     Coleta o estado atual da farm (workers e tarefas).
     Retorna o sub-dicionário 'farm_state' do payload de performance.
     """
-    global tasks_completed, tasks_failed
-
     with state_lock:
-        total_local     = len(workers_local)
-        total_borrowed  = len(workers_borrowed)
-        tc              = tasks_completed
-        tf              = tasks_failed
-        pending         = task_queue.qsize()
-        # Workers emprestados que este master está gerenciando (received)
-        received_ids    = list(workers_borrowed.keys())
-        # Para simplificar, considera busy se conn existir e tarefa em andamento
-        # (sem flag busy individual, usamos total como proxy)
-        workers_alive   = total_local + total_borrowed
-        workers_idle    = max(0, total_local - 0)   # todos locais disponíveis
-        workers_running = min(pending, workers_alive)
+        # Nativos ainda presentes neste master
+        total_local    = len(workers_local)
+        # Recebidos de outro master (direction "in")
+        total_received = len(workers_borrowed)
+        # Emprestados para outro master (direction "out")
+        total_lent_out = len(workers_lent_out)
 
-    # borrowed_workers: lista com direção
-    # "out" = workers que este master emprestou para outro (não rastreado diretamente,
-    #         pois após o redirect eles saem de workers_local)
-    # "in"  = workers que este master recebeu (workers_borrowed)
-    borrowed_list = [
-        {"direction": "in", "peer_uuid": info.get("original_master", "unknown")}
-        for info in workers_borrowed.values()
-    ]
+        tc      = tasks_completed
+        tf      = tasks_failed
+        wf      = workers_failed_count
+        pending = task_queue.qsize()
 
-    # Calcular oldest_task_age_s: não temos timestamp por tarefa, reportamos 0
-    oldest_task_age = 0
+        # workers_home = todos os nativos, incluindo os que foram emprestados para fora
+        workers_home_count = total_local + total_lent_out
+
+        # workers ativos visíveis neste master = locais + recebidos
+        workers_alive   = total_local + total_received
+        # workers ociosos = locais que não estão ocupados
+        workers_idle    = max(0, sum(1 for w in workers_local.values() if not w.get("busy", False)))
+        # workers em utilização = locais ocupados + recebidos em uso
+        workers_running = workers_alive - workers_idle
+
+        # borrowed_workers: "out" = emprestados daqui para outro master
+        #                   "in"  = recebidos de outro master
+        borrowed_list = []
+        for info in workers_lent_out.values():
+            borrowed_list.append({
+                "direction": "out",
+                "peer_uuid": info.get("peer_master", "unknown")
+            })
+        for info in workers_borrowed.values():
+            borrowed_list.append({
+                "direction": "in",
+                "peer_uuid": info.get("original_master", "unknown")
+            })
+
+        # oldest_task_age_s: idade da tarefa mais antiga ainda na fila
+        now = time.time()
+        if task_queue_timestamps:
+            oldest_task_age = int(now - task_queue_timestamps[0])
+        else:
+            oldest_task_age = 0
 
     return {
         "workers": {
-            "total_registered":          total_local + total_borrowed,
-            "workers_utilization":       workers_running,
-            "workers_alive":             workers_alive,
-            "workers_idle":              workers_idle,
-            "workers_borrowed":          0,            # emprestados para outros (saíram da lista)
-            "workers_received":          total_borrowed,
-            "workers_failed":            0,
-            "workers_home":              total_local,
+            "total_registered":           total_local + total_received,
+            "workers_utilization":        workers_running,
+            "workers_alive":              workers_alive,
+            "workers_idle":               workers_idle,
+            "workers_borrowed":           total_lent_out,
+            "workers_received":           total_received,
+            "workers_failed":             wf,
+            "workers_home":               workers_home_count,
             "workers_available_capacity": workers_idle,
-            "borrowed_workers":          borrowed_list,
+            "borrowed_workers":           borrowed_list,
         },
         "tasks": {
-            "tasks_pending":      pending,
-            "tasks_running":      workers_running,
-            "tasks_completed":    tc,
-            "tasks_failed":       tf,
-            "oldest_task_age_s":  oldest_task_age,
+            "tasks_pending":     pending,
+            "tasks_running":     workers_running,
+            "tasks_completed":   tc,
+            "tasks_failed":      tf,
+            "oldest_task_age_s": oldest_task_age,
         },
     }
 
@@ -311,7 +331,7 @@ def montar_payload_sprint4() -> dict:
     Monta o payload completo exigido pela Sprint 4.
     """
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    hostname  = socket.getfqdn() or f"{MASTER_ID}.farm.local"
+    hostname  = f"{MASTER_ID}.farm.local"
 
     sistema   = coletar_metricas_sistema()
     farm      = coletar_estado_farm()
@@ -487,8 +507,10 @@ def handle_election_ack(conn, payload: dict) -> bool:
 def populate_queue(n=20):
     users = ["Alice", "Bob", "Carlos", "Diana", "Eduardo",
              "Fernanda", "Gabriel", "Helena", "Igor", "Julia"]
+    now = time.time()
     for i in range(n):
         task_queue.put(users[i % len(users)])
+        task_queue_timestamps.append(now)
     log("FILA", f"{task_queue.qsize()} tarefas adicionadas.")
 
 def monitor_load():
@@ -553,6 +575,9 @@ def handle_worker_alive(conn, payload: dict):
 
     if not task_queue.empty():
         user = task_queue.get()
+        with state_lock:
+            if task_queue_timestamps:
+                task_queue_timestamps.pop(0)
         send_json(conn, {"TASK": "QUERY", "USER": user})
         log("TASK", f"QUERY USER={user} → {worker_uuid} ({'emprestado' if original_master else 'local'})")
     else:
@@ -721,8 +746,17 @@ def enviar_command_redirect(worker_uuid: str, new_master_address: str):
         "payload": {"new_master_address": new_master_address}
     })
     log("REDIRECT", f"command_redirect → {worker_uuid} | {new_master_address}", req_id=req_id_red)
+
+    # Identifica o peer_master a partir do endereço de destino
+    peer_master_id = new_master_address  # fallback: usa o endereço como identificador
+    for nid, nip, nport in NEIGHBOR_MASTERS:
+        if new_master_address == f"{nip}:{nport}":
+            peer_master_id = nid
+            break
+
     with state_lock:
         workers_local.pop(worker_uuid, None)
+        workers_lent_out[worker_uuid] = {"peer_master": peer_master_id}
     log_worker_state()
 
 def handle_register_temporary_worker(conn, payload_outer: dict):
@@ -779,6 +813,8 @@ def notify_worker_returned(worker_id, original_master_address):
 
 def handle_notify_worker_returned(payload_outer: dict):
     worker_id = payload_outer.get("payload", {}).get("worker_id", "?")
+    with state_lock:
+        workers_lent_out.pop(worker_id, None)
     log("NOTIFY", f"Worker {worker_id} devolvido. Aguardando reconexão.")
 
 # ═══════════════════════════════════════════════════════════════════
