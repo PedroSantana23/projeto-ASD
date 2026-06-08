@@ -1,15 +1,18 @@
 """
-master.py — Sprint 2.1 + Sprint 1 + Sprint 2 + Sprint 3
-Descoberta Dinâmica via UDP + Balanceamento de Carga P2P
+master.py — Sprint 2.1 + Sprint 1 + Sprint 2 + Sprint 3 + Sprint 4
+Descoberta Dinâmica via UDP + Balanceamento de Carga P2P + Relatório de Métricas
 """
 
 import socket
+import ssl
 import threading
 import json
 import queue
 import time
 import uuid
 import argparse
+import psutil
+import os
 
 # ═══════════════════════════════════════════════════════════════════
 # ARGUMENTOS DE LINHA DE COMANDO
@@ -25,9 +28,25 @@ def get_local_ip():
 
 parser = argparse.ArgumentParser(description="Master — P2P com Balanceamento de Carga")
 parser.add_argument("--host",      type=str, default=get_local_ip(), help="IP do Master (padrão: IP local detectado)")
-parser.add_argument("--port",      type=int, default=10000,           help="Porta TCP do Master (padrão: 8000)")
-parser.add_argument("--id",        type=str, default="Master_2",     help="ID do Master (padrão: Master_2)")
-parser.add_argument("--udp-port",  type=int, default=8000,           help="Porta UDP de descoberta (padrão: 5000)")
+parser.add_argument("--port",      type=int, default=10000,           help="Porta TCP do Master (padrão: 10000)")
+parser.add_argument("--id",        type=str, default="MASTER_2",     help="ID do Master (padrão: MASTER_2)")
+parser.add_argument("--udp-port",  type=int, default=8000,            help="Porta UDP de descoberta (padrão: 8000)")
+
+# Master vizinha que pode emprestar workers.
+# Formato: ID:IP:PORTA
+# Exemplo: --neighbor-master Master_1:10.62.206.218:10000
+parser.add_argument(
+    "--neighbor-master",
+    action="append",
+    default=None,
+    help="Master vizinha no formato ID:IP:PORTA. Pode repetir o argumento para cadastrar mais de uma."
+)
+parser.add_argument(
+    "--no-default-neighbor",
+    action="store_true",
+    help="Desativa a master vizinha padrão 10.62.206.218:10000."
+)
+
 args = parser.parse_args()
 
 HOST      = args.host
@@ -42,9 +61,74 @@ CAPACITY          = 10
 RELEASE_THRESHOLD = 5
 
 # Vizinhos Masters (para Sprint 3)
-NEIGHBOR_MASTERS = []
+DEFAULT_NEIGHBOR_MASTERS = [
+    ("Master_1", "10.62.206.218", 10000),
+]
+
+def parse_neighbor_master(spec: str) -> tuple[str, str, int] | None:
+    """
+    Converte uma master vizinha no formato ID:IP:PORTA.
+    Exemplo: Master_1:10.62.206.218:10000
+    """
+    try:
+        neighbor_id, neighbor_ip, neighbor_port = spec.rsplit(":", 2)
+        neighbor_id = neighbor_id.strip()
+        neighbor_ip = neighbor_ip.strip()
+        neighbor_port = int(neighbor_port.strip())
+
+        if not neighbor_id or not neighbor_ip:
+            raise ValueError("ID/IP vazio")
+
+        return neighbor_id, neighbor_ip, neighbor_port
+    except Exception as e:
+        print(f"[CONFIG] Vizinho inválido '{spec}'. Use ID:IP:PORTA. Erro: {e}", flush=True)
+        return None
+
+def build_neighbor_masters() -> list[tuple[str, str, int]]:
+    neighbors: list[tuple[str, str, int]] = []
+
+    if not args.no_default_neighbor:
+        neighbors.extend(DEFAULT_NEIGHBOR_MASTERS)
+
+    if args.neighbor_master:
+        for spec in args.neighbor_master:
+            parsed = parse_neighbor_master(spec)
+            if parsed:
+                neighbors.append(parsed)
+
+    clean_neighbors: list[tuple[str, str, int]] = []
+    seen = set()
+    for neighbor_id, neighbor_ip, neighbor_port in neighbors:
+        key = (neighbor_ip, neighbor_port)
+        if key == (HOST, PORT):
+            print(f"[CONFIG] Ignorando vizinho {neighbor_id} porque aponta para este próprio master.", flush=True)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_neighbors.append((neighbor_id, neighbor_ip, neighbor_port))
+
+    return clean_neighbors
+
+NEIGHBOR_MASTERS = build_neighbor_masters()
 
 NEGOTIATION_TIMEOUT = 5
+
+# ═══════════════════════════════════════════════════════════════════
+# SPRINT 4 — CONFIGURAÇÃO DO SUPERVISOR
+# ═══════════════════════════════════════════════════════════════════
+
+SUPERVISOR_HOST     = "nuted-ia.dev"
+SUPERVISOR_PORT     = 443
+SUPERVISOR_TLS      = True
+SUPERVISOR_INTERVAL = 10   # segundos entre cada envio
+
+# Timestamp de início do processo (para calcular uptime)
+_START_TIME = time.time()
+
+# Contadores de tarefas (thread-safe via state_lock)
+tasks_completed = 0
+tasks_failed    = 0
 
 # ═══════════════════════════════════════════════════════════════════
 # ESTADO GLOBAL
@@ -105,6 +189,199 @@ def strict_parse(payload: dict, required_fields: list, context: str) -> bool:
             log("PARSE_ERR", f"[{context}] Campo obrigatório ausente: '{field}'")
             return False
     return True
+
+# ═══════════════════════════════════════════════════════════════════
+# SPRINT 4 — COLETA DE MÉTRICAS DO SISTEMA
+# ═══════════════════════════════════════════════════════════════════
+
+def coletar_metricas_sistema() -> dict:
+    """
+    Coleta métricas reais do sistema via psutil.
+    Retorna o sub-dicionário 'system' do payload de performance.
+    """
+    uptime = int(time.time() - _START_TIME)
+
+    # Load average (Linux/macOS); no Windows retorna (0,0,0)
+    try:
+        la1, la5, _ = os.getloadavg()
+    except (AttributeError, OSError):
+        la1, la5 = 0.0, 0.0
+
+    cpu_percent  = psutil.cpu_percent(interval=None)
+    cpu_logical  = psutil.cpu_count(logical=True)  or 1
+    cpu_physical = psutil.cpu_count(logical=False) or 1
+
+    mem  = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    return {
+        "uptime_seconds":    uptime,
+        "load_average_1m":   round(la1, 2),
+        "load_average_5m":   round(la5, 2),
+        "cpu": {
+            "usage_percent":  round(cpu_percent, 2),
+            "count_logical":  cpu_logical,
+            "count_physical": cpu_physical,
+        },
+        "memory": {
+            "total_mb":      int(mem.total     / 1024 / 1024),
+            "available_mb":  int(mem.available / 1024 / 1024),
+            "percent_used":  round(mem.percent, 2),
+            "memory_used":   int(mem.used      / 1024 / 1024),
+        },
+        "disk": {
+            "total_gb":    round(disk.total / 1024 ** 3, 1),
+            "free_gb":     round(disk.free  / 1024 ** 3, 1),
+            "percent_used": round(disk.percent, 1),
+        },
+    }
+
+def coletar_estado_farm() -> dict:
+    """
+    Coleta o estado atual da farm (workers e tarefas).
+    Retorna o sub-dicionário 'farm_state' do payload de performance.
+    """
+    global tasks_completed, tasks_failed
+
+    with state_lock:
+        total_local     = len(workers_local)
+        total_borrowed  = len(workers_borrowed)
+        tc              = tasks_completed
+        tf              = tasks_failed
+        pending         = task_queue.qsize()
+        # Workers emprestados que este master está gerenciando (received)
+        received_ids    = list(workers_borrowed.keys())
+        # Para simplificar, considera busy se conn existir e tarefa em andamento
+        # (sem flag busy individual, usamos total como proxy)
+        workers_alive   = total_local + total_borrowed
+        workers_idle    = max(0, total_local - 0)   # todos locais disponíveis
+        workers_running = min(pending, workers_alive)
+
+    # borrowed_workers: lista com direção
+    # "out" = workers que este master emprestou para outro (não rastreado diretamente,
+    #         pois após o redirect eles saem de workers_local)
+    # "in"  = workers que este master recebeu (workers_borrowed)
+    borrowed_list = [
+        {"direction": "in", "peer_uuid": info.get("original_master", "unknown")}
+        for info in workers_borrowed.values()
+    ]
+
+    # Calcular oldest_task_age_s: não temos timestamp por tarefa, reportamos 0
+    oldest_task_age = 0
+
+    return {
+        "workers": {
+            "total_registered":          total_local + total_borrowed,
+            "workers_utilization":       workers_running,
+            "workers_alive":             workers_alive,
+            "workers_idle":              workers_idle,
+            "workers_borrowed":          0,            # emprestados para outros (saíram da lista)
+            "workers_received":          total_borrowed,
+            "workers_failed":            0,
+            "workers_home":              total_local,
+            "workers_available_capacity": workers_idle,
+            "borrowed_workers":          borrowed_list,
+        },
+        "tasks": {
+            "tasks_pending":      pending,
+            "tasks_running":      workers_running,
+            "tasks_completed":    tc,
+            "tasks_failed":       tf,
+            "oldest_task_age_s":  oldest_task_age,
+        },
+    }
+
+def coletar_vizinhos() -> list:
+    """
+    Monta a lista de vizinhos para o payload.
+    Marca como 'available' (sem ping ativo; seria possível adicionar verificação).
+    """
+    vizinhos = []
+    ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for neighbor_id, neighbor_ip, neighbor_port in NEIGHBOR_MASTERS:
+        vizinhos.append({
+            "server_uuid":    neighbor_id,
+            "status":         "available",
+            "last_heartbeat": ts_now,
+        })
+    return vizinhos
+
+def montar_payload_sprint4() -> dict:
+    """
+    Monta o payload completo exigido pela Sprint 4.
+    """
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    hostname  = socket.getfqdn() or f"{MASTER_ID}.farm.local"
+
+    sistema   = coletar_metricas_sistema()
+    farm      = coletar_estado_farm()
+    vizinhos  = coletar_vizinhos()
+
+    return {
+        "server_uuid":     MASTER_ID,
+        "hostname":        hostname,
+        "role":            "master",
+        "task":            "performance_report",
+        "timestamp":       timestamp,
+        "message_id":      str(uuid.uuid4()),
+        "payload_version": "sprint4-monitor",
+        "performance": {
+            "system": sistema,
+            "farm_state": farm,
+            "config_thresholds": {
+                "max_task":           CAPACITY,
+                "warn_cpu_percent":   85,
+                "warn_memory_percent": 85,
+                "release_task":       RELEASE_THRESHOLD,
+            },
+            "neighbors": vizinhos,
+        },
+    }
+
+def enviar_metricas_supervisor():
+    """
+    Abre uma conexão TLS/TCP com o supervisor, envia o payload JSON
+    (terminado em \\n) e fecha a conexão. Não aguarda resposta.
+    """
+    payload = montar_payload_sprint4()
+    data    = (json.dumps(payload) + "\n").encode("utf-8")
+
+    try:
+        # Cria socket TCP puro
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(10)
+
+        # Envolve com TLS
+        ctx = ssl.create_default_context()
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=SUPERVISOR_HOST)
+
+        tls_sock.connect((SUPERVISOR_HOST, SUPERVISOR_PORT))
+        tls_sock.sendall(data)
+        tls_sock.close()
+
+        log("SPRINT4", f"Métricas enviadas ao supervisor ({len(data)} bytes) | "
+                       f"workers_local={len(workers_local)} "
+                       f"workers_borrowed={len(workers_borrowed)} "
+                       f"tasks_pending={task_queue.qsize()}")
+    except ssl.SSLError as e:
+        log("SPRINT4", f"Erro TLS ao enviar métricas: {e}")
+    except OSError as e:
+        log("SPRINT4", f"Erro de rede ao enviar métricas: {e}")
+    except Exception as e:
+        log("SPRINT4", f"Erro inesperado ao enviar métricas: {e}")
+
+def loop_supervisor():
+    """
+    Envia métricas ao supervisor a cada SUPERVISOR_INTERVAL segundos.
+    Executa em thread daemon separada — nunca bloqueia o servidor principal.
+    """
+    log("SPRINT4", f"Iniciando loop de métricas → {SUPERVISOR_HOST}:{SUPERVISOR_PORT} "
+                   f"(TLS) a cada {SUPERVISOR_INTERVAL}s")
+    # Pequena pausa inicial para o servidor TCP subir primeiro
+    time.sleep(3)
+    while True:
+        enviar_metricas_supervisor()
+        time.sleep(SUPERVISOR_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════════
 # SPRINT 2.1 — DESCOBERTA UDP
@@ -184,7 +461,6 @@ def handle_election_ack(conn, payload: dict) -> bool:
     worker_uuid      = payload["WORKER_UUID"]
     selected_master  = payload["SELECTED_MASTER"]
 
-    # Valida se o Worker elegeu este Master
     if selected_master != MASTER_ID:
         log("ELECTION",
             f"Worker {worker_uuid} elegeu '{selected_master}' mas conectou em '{MASTER_ID}'. "
@@ -257,6 +533,8 @@ def handle_heartbeat(conn, payload: dict):
 # ═══════════════════════════════════════════════════════════════════
 
 def handle_worker_alive(conn, payload: dict):
+    global tasks_completed, tasks_failed
+
     if not strict_parse(payload, ["WORKER", "WORKER_UUID"], "WORKER_ALIVE"):
         return
 
@@ -282,6 +560,8 @@ def handle_worker_alive(conn, payload: dict):
         log("TASK", f"NO_TASK → {worker_uuid}")
 
 def handle_status(conn, payload: dict):
+    global tasks_completed, tasks_failed
+
     if not strict_parse(payload, ["STATUS", "TASK", "WORKER_UUID"], "STATUS"):
         return
 
@@ -291,6 +571,13 @@ def handle_status(conn, payload: dict):
     if status not in ("OK", "NOK"):
         log("PARSE_ERR", f"STATUS inválido: '{status}'")
         return
+
+    # Atualiza contadores para Sprint 4
+    with state_lock:
+        if status == "OK":
+            tasks_completed += 1
+        else:
+            tasks_failed += 1
 
     origem = "EMPRESTADO" if worker_uuid in workers_borrowed else "LOCAL"
     log("STATUS", f"{worker_uuid} ({origem}) → {status}")
@@ -303,13 +590,24 @@ def handle_status(conn, payload: dict):
 # ═══════════════════════════════════════════════════════════════════
 
 def solicitar_ajuda():
+    if not NEIGHBOR_MASTERS:
+        log("NEG", "Nenhum master vizinho configurado para pedir workers.")
+        return
+
     with state_lock:
         workers_needed = max(1, (load_counter - CAPACITY) // 2 + 1)
-    log("NEG", f"Buscando {workers_needed} worker(s).")
+
+    log("NEG", f"Buscando {workers_needed} worker(s) em {len(NEIGHBOR_MASTERS)} master(s) vizinha(s).")
+
     for (neighbor_id, neighbor_ip, neighbor_port) in NEIGHBOR_MASTERS:
+        if (neighbor_ip, neighbor_port) == (HOST, PORT):
+            log("NEG", f"Ignorando {neighbor_id}, pois aponta para este próprio master.")
+            continue
+
         if pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed):
             return
-    log("NEG", "Nenhum vizinho disponível.")
+
+    log("NEG", "Nenhum vizinho conseguiu emprestar workers.")
 
 def pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed) -> bool:
     request_id = str(uuid.uuid4())
@@ -342,8 +640,8 @@ def pedir_ao_vizinho(neighbor_id, neighbor_ip, neighbor_port, workers_needed) ->
         log("REQUEST_HELP", f"Timeout. request_id descartado. Tentando próximo.", req_id=request_id)
         return False
 
-    r_type   = response.get("type", "")
-    r_req_id = response.get("request_id", "")
+    r_type    = response.get("type", "")
+    r_req_id  = response.get("request_id", "")
     r_payload = response.get("payload", {})
 
     if r_req_id != request_id:
@@ -365,9 +663,9 @@ def handle_request_help(conn, payload_outer: dict):
     if not strict_parse(p, ["master_id", "master_address", "workers_needed"], "request_help"):
         return
 
-    requester_id  = p["master_id"]
+    requester_id   = p["master_id"]
     requester_addr = p["master_address"]
-    needed        = int(p["workers_needed"])
+    needed         = int(p["workers_needed"])
 
     log("REQUEST_HELP", f"← {requester_id} pediu {needed} worker(s)", req_id=request_id)
 
@@ -575,6 +873,9 @@ def iniciar_servidor_tcp():
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Inicializa cpu_percent para a primeira leitura não-bloqueante
+    psutil.cpu_percent(interval=None)
+
     populate_queue(20)
     log("MASTER", f"Iniciando {MASTER_ID} | {HOST}:{PORT}")
     log("MASTER", f"Saturação>{CAPACITY} | Liberação<{RELEASE_THRESHOLD}")
@@ -585,6 +886,9 @@ if __name__ == "__main__":
 
     # Thread de monitoramento de carga
     threading.Thread(target=monitor_load, daemon=True).start()
+
+    # Sprint 4: Thread de envio de métricas ao supervisor
+    threading.Thread(target=loop_supervisor, daemon=True).start()
 
     # Servidor TCP principal (bloqueante)
     iniciar_servidor_tcp()

@@ -17,7 +17,7 @@ WORKER_UUID = f"Worker-{uuid.uuid4().hex[:6]}"
 
 # ── Sprint 2.1: Worker NÃO tem IP/porta configurados ──────────────
 # Descobre o Master automaticamente via UDP Broadcast
-UDP_DISCOVERY_PORT    = 5000          # mesma porta que o Master escuta
+UDP_DISCOVERY_PORT    = 8000          # mesma porta que o Master escuta
 UDP_BROADCAST_ADDR    = "255.255.255.255"
 DISCOVERY_TIMEOUT     = 3             # janela de coleta de respostas (spec: 3s)
 
